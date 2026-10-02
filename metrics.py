@@ -174,7 +174,6 @@ def compute_idf1(ground_truth, preds, threshold=0.5):
 
 
 
-
 def naive_tracker_shift(ground_truth_data, threshold: float=0.5, max_age: int=3):
     """
     Rastreador ingenuo com memoria de K quadros.
@@ -400,11 +399,10 @@ def evaluate_trajectories(ground_truth, preds, threshold=0.5):
         "Erro de Contagem de IDs": id_count_error
     }
 
-def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=0.5, max_age=3):
+def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=0.3, max_age=3, min_hits=2, T=8):
     """
-    Rastreador inteligente (Trilha A).
-    Usa o modelo GRU para prever o movimento dos pedestres e associa via IoU.
-    Em caso de oclusão, utiliza a própria previsão para sobreviver (coasting).
+    Rastreador Inteligente Final (Trilha A).
+    Usa a GRU estritamente para translação (x,y) e congela a escala (w,h).
     """
     detections = np.array([list(map(float, x.split(','))) for x in ground_truth_data])
     if len(detections) == 0: return []
@@ -412,51 +410,54 @@ def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=
     
     tracked_results = []
     next_new_id = 1 
-    
-    # {ID: {'bbox': array_9_colunas, 'age': int, 'hidden': tensor}}
     active_tracks = {}
-    
     model.eval()
     
     for f in range(1, num_frames + 1):
         frame_t = detections[detections[:, 0] == f]
         active_ids = list(active_tracks.keys())
-        
-        # --- PASSO 1: PREVISÃO GRU PARA TODAS AS TRACKS ATIVAS ---
         predicted_matrix = []
         
+        # --- PASSO 1: PREVISÃO GRU (X e Y apenas) ---
         for tid in active_ids:
             track = active_tracks[tid]
-            bbox = track['bbox']
-            hidden = track['hidden']
+            tamanho_necessario = T - 1
             
-            # Normaliza para a escala [0, 1] baseada na resolução da imagem real
-            norm_bbox = torch.tensor([
-                bbox[2] / img_w, bbox[3] / img_h, 
-                bbox[4] / img_w, bbox[5] / img_h
-            ], dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device) # Shape: (1, 1, 4)
+            # Última posição real observada
+            x_last, y_last, w_last, h_last = track['bbox'][2:6]
             
-            with torch.no_grad():
-                pred_norm, new_hidden = model(norm_bbox, hidden)
+            if len(track['history']) < tamanho_necessario:
+                # Inércia Zero
+                x, y, w, h = x_last, y_last, w_last, h_last
+            else:
+                historico = track['history'][-tamanho_necessario:]
+                seq_input = torch.tensor(historico, dtype=torch.float32).unsqueeze(0).to(device)
                 
-            # Desnormaliza de volta para pixels
-            pred_box = pred_norm.squeeze().cpu().numpy()
-            pred_box = [pred_box[0]*img_w, pred_box[1]*img_h, pred_box[2]*img_w, pred_box[3]*img_h]
+                # Removi a inicialização manual do hidden. 
+                # Ao passar 'None', o PyTorch cria automaticamente zeros no formato certo (seja GRU, LSTM ou RNN simples).
+                with torch.no_grad():
+                    pred_norm, _ = model(seq_input, None)
+                
+                pred_box = pred_norm.view(-1).cpu().numpy()
+                
+                # REMOVEMOS O TRAVÃO: A GRU assume 100% do controlo da translação
+                x = pred_box[0] * img_w
+                y = pred_box[1] * img_h
+                
+                # CONGELAMENTO DE ESCALA: Mantido para impedir caixas palito
+                w = w_last
+                h = h_last
             
-            # Salva o novo estado oculto na memória da track
-            track['new_hidden'] = new_hidden
-            
-            # Forja um array no formato MOT para usar no calculate_iou_matrix
             dummy_box = np.zeros(9)
             dummy_box[0] = f
             dummy_box[1] = tid
-            dummy_box[2:6] = pred_box
+            dummy_box[2:6] = [x, y, w, h]
             dummy_box[6:9] = 1.0
             predicted_matrix.append(dummy_box)
-            
+             
         predicted_matrix = np.array(predicted_matrix) if len(predicted_matrix) > 0 else np.zeros((0, 9))
         
-        # --- PASSO 2: MATCHING (Usando a PREVISÃO e não a caixa antiga) ---
+        # --- PASSO 2: MATCHING ---
         if len(predicted_matrix) > 0 and len(frame_t) > 0:
             iou_matrix = calculate_iou_matrix(predicted_matrix, frame_t)
             matches_iou, matches = greedy_match(iou_matrix, len(predicted_matrix), len(frame_t))
@@ -473,21 +474,21 @@ def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=
                 matched_current_to_memory[int(t_idx)] = p_idx
                 matched_memory_indices.add(p_idx)
                 
-        # --- PASSO 3: ATUALIZAR OBSERVAÇÕES E NASCIMENTO ---
+        # --- PASSO 3: ATUALIZAÇÃO COM OBSERVAÇÃO REAL ---
         for t_idx in range(len(frame_t)):
             res = frame_t[t_idx].copy()
+            norm_obs = [res[2]/img_w, res[3]/img_h, res[4]/img_w, res[5]/img_h]
             
             if t_idx in matched_current_to_memory:
-                # MATCH COM SUCESSO: Atualiza a caixa com a posição real observada
                 p_idx = matched_current_to_memory[t_idx]
                 track_id = active_ids[p_idx]
                 
                 res[1] = track_id
                 active_tracks[track_id]['bbox'] = res
-                active_tracks[track_id]['hidden'] = active_tracks[track_id]['new_hidden']
+                active_tracks[track_id]['history'].append(norm_obs)
                 active_tracks[track_id]['age'] = 0
+                active_tracks[track_id]['hits'] += 1
             else:
-                # NASCIMENTO: Inicia um novo estado oculto limpo para este objeto
                 track_id = next_new_id
                 next_new_id += 1
                 
@@ -495,23 +496,29 @@ def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=
                 active_tracks[track_id] = {
                     'bbox': res,
                     'age': 0,
-                    'hidden': model.init_hidden(batch_size=1, device=device)
+                    'history': [norm_obs],
+                    'hits': 1 
                 }
                 
-            tracked_results.append(res)
+            # Mostra se a track foi confirmada
+            if active_tracks[res[1]]['hits'] >= min_hits:
+                tracked_results.append(res)
             
-        # --- PASSO 4: OCLUSÃO E MORTE (SOBREVIVÊNCIA COM GRU) ---
+        # --- PASSO 4: OCLUSÃO E MORTE ---
         tracks_to_delete = []
         for p_idx, track_id in enumerate(active_ids):
             if p_idx not in matched_memory_indices:
                 active_tracks[track_id]['age'] += 1
                 
-                # SE ESTÁ OCLUÍDO (idade < max_age): Sobrevive preenchendo o buraco com a previsão da GRU
                 if active_tracks[track_id]['age'] < max_age:
                     fake_res = predicted_matrix[p_idx].copy()
                     active_tracks[track_id]['bbox'] = fake_res
-                    active_tracks[track_id]['hidden'] = active_tracks[track_id]['new_hidden']
-                    tracked_results.append(fake_res) # Salva a previsão fantasma no histórico
+                    
+                    norm_fake = [fake_res[2]/img_w, fake_res[3]/img_h, fake_res[4]/img_w, fake_res[5]/img_h]
+                    active_tracks[track_id]['history'].append(norm_fake)
+                    
+                    if active_tracks[track_id]['hits'] >= min_hits:
+                        tracked_results.append(fake_res)
                 else:
                     tracks_to_delete.append(track_id)
                     
