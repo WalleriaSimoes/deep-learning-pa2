@@ -1,5 +1,7 @@
 import numpy as np
 import cv2
+import torch
+import random
 
 class EllipsesSimulator:
     def __init__(self, img_size, num_obj, dur_occlusion, speed=1):
@@ -163,3 +165,61 @@ def create_noisy_bboxes(frames, ground_truth, percentage, fp_rate=0.05):
         noisy_annotations.append(f"{f+1}, -1, {x}, {y}, {w}, {h}, 1, 1, 1.0")
 
     return frames_with_noisy_bboxes, noisy_annotations
+
+def gerar_trajetoria_elipse(num_quadros=60, image_size=128):
+    """
+    Simula o movimento de 1 elipse (caixa limitadora) em linha reta com velocidade constante.
+    Adiciona um pequeno ruído para simular imperfeições da detecção (como exigido no PA2).
+    """
+    # Posição inicial e tamanho aleatórios
+    x = random.uniform(10, image_size - 40)
+    y = random.uniform(10, image_size - 40)
+    w = random.uniform(10, 25)
+    h = random.uniform(10, 25)
+    
+    # Velocidade (pixels por quadro)
+    vx = random.uniform(-2, 2)
+    vy = random.uniform(-2, 2)
+    
+    trajetoria = []
+    for _ in range(num_quadros):
+        # Atualiza a posição
+        x += vx
+        y += vy
+        
+        # Injeta ruído sintético (simulador de detector imperfeito)
+        ruido_x = random.uniform(-1, 1)
+        ruido_y = random.uniform(-1, 1)
+        
+        caixa = [x + ruido_x, y + ruido_y, w, h]
+        trajetoria.append(caixa)
+        
+    return torch.tensor(trajetoria, dtype=torch.float32)
+
+# --- 2. O Fatiador de Janelas (BPTT) ---
+def preparar_janelas_treino(trajetoria, tamanho_janela_T):
+    """
+    Desliza uma janela sobre a trajetória para criar pares de (Passado, Futuro).
+    Retorna os tensores no formato (batch_size, seq_len, features)
+    """
+    num_quadros = trajetoria.size(0)
+    inputs = []
+    targets = []
+    
+    # Desliza a janela pela trajetória
+    for i in range(num_quadros - tamanho_janela_T):
+        # Pega T quadros
+        janela = trajetoria[i : i + tamanho_janela_T]
+        
+        # O input é do quadro 0 até o T-1 da janela
+        seq_in = janela[:-1, :]
+        # O target é o último quadro da janela
+        alvo = janela[-1, :]
+        
+        inputs.append(seq_in)
+        targets.append(alvo)
+        
+    # Empilha tudo numa dimensão de batch
+    # Formato final inputs: (batch_size, T-1, 4)
+    # Formato final targets: (batch_size, 4)
+    return torch.stack(inputs), torch.stack(targets)
