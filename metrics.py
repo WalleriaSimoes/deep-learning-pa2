@@ -396,7 +396,8 @@ def evaluate_trajectories(ground_truth, preds, threshold=0.5):
         "IDF1 Score": idf1_score,
         "ID Switches": id_switches,
         "Fragmentacoes": fragmentations,
-        "Erro de Contagem de IDs": id_count_error
+        "Erro de Contagem de IDs": id_count_error,
+        "Track History": track_history 
     }
 
 def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=0.3, max_age=3, min_hits=2, T=8):
