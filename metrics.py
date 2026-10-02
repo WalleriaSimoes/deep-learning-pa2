@@ -270,3 +270,131 @@ def naive_tracker_shift(ground_truth_data, threshold: float=0.5, max_age: int=3)
             del active_tracks[tid]
 
     return np.array(tracked_results)
+
+
+
+def evaluate_trajectories(ground_truth, preds, threshold=0.5):
+    """
+    Avalia as trajetorias calculando IDF1, ID Switches, Fragmentacoes 
+    e Erro de Contagem de identidades unicas.
+    """
+    parts_t = np.array([list(map(float, x.split(','))) for x in ground_truth])
+    parts_p = np.array([list(map(float, x.split(','))) for x in preds])
+
+    unique_true_ids = np.unique(parts_t[:, 1])
+    unique_preds_ids = np.unique(parts_p[:, 1]) if len(parts_p) > 0 else np.array([])
+    
+    num_trues = len(unique_true_ids)
+    num_preds = len(unique_preds_ids)
+
+    # Erro de Contagem de Identidades unicas (Analogo ao erro de contagem do PA1)
+    id_count_error = abs(num_preds - num_trues)
+
+    global_match_matrix = np.zeros((num_preds, num_trues))
+    map_t = {id_val: idx for idx, id_val in enumerate(unique_true_ids)}
+    map_p = {id_val: idx for idx, id_val in enumerate(unique_preds_ids)}
+
+    previous_match = {}  
+    id_switches = 0
+    
+    # Historico de rastreamento para contar Fragmentacoes: 
+    # Guarda 1 (rastreado) ou 0 (perdido) para cada frame em que o ID real aparece
+    track_history = {tid: [] for tid in unique_true_ids}
+
+    # Identifica o numero total de frames no video
+    num_frames = int(max(
+        np.max(parts_t[:, 0]) if len(parts_t) > 0 else 0, 
+        np.max(parts_p[:, 0]) if len(parts_p) > 0 else 0
+    ))
+    
+    for f in range(1, num_frames + 1):
+        frame_t = parts_t[parts_t[:, 0] == f]
+        frame_p = parts_p[parts_p[:, 0] == f]
+
+        if len(frame_t) == 0:
+            continue
+            
+        ids_t = frame_t[:, 1]
+        
+        if len(frame_p) == 0:
+            for t_id in ids_t:
+                track_history[t_id].append(0)
+            continue
+
+        ids_p = frame_p[:, 1]
+
+        iou_matrix = calculate_iou_matrix(frame_p, frame_t)
+        
+        # Pareamento local do frame
+        matches_iou, matches = greedy_match(iou_matrix, len(ids_p), len(ids_t))
+        
+        current_match = {}
+        matched_true_ids = set()
+
+        for p_idx in range(len(ids_p)):
+            t_idx = matches[p_idx]
+            
+            if t_idx is None or matches_iou[p_idx] < threshold:
+                continue
+                
+            t_idx = int(t_idx)
+            real_id_p = ids_p[p_idx]
+            real_id_t = ids_t[t_idx]
+            
+            mat_row = map_p[real_id_p]
+            mat_col = map_t[real_id_t]
+            
+            # Popula a matriz global para o IDF1
+            global_match_matrix[mat_row, mat_col] += 1
+            
+            current_match[real_id_t] = real_id_p
+            matched_true_ids.add(real_id_t)
+            
+            # Contagem de ID Switches explicita
+            if real_id_t in previous_match:
+                if previous_match[real_id_t] != real_id_p:
+                    id_switches += 1
+            
+        for t_id, p_id in current_match.items():
+            previous_match[t_id] = p_id
+            
+        # Registo do estado para as Fragmentacoes
+        for t_id in ids_t:
+            if t_id in matched_true_ids:
+                track_history[t_id].append(1) # Foi rastreado neste frame
+            else:
+                track_history[t_id].append(0) # Foi ocluído/perdido neste frame
+
+    # Contagem de Fragmentações
+    fragmentations = 0
+    for tid, history in track_history.items():
+        # Uma fragmentacao ocorre quando a trajetoria passa de rastreada (1) 
+        # para perdida (0) e regressa a rastreada (1) num frame futuro.
+        for i in range(1, len(history)):
+            if history[i-1] == 1 and history[i] == 0:
+                if 1 in history[i:]:
+                    fragmentations += 1
+
+    # Calculo do IDF1 (Atribuicao Global 1-para-1)
+    if num_preds == 0 or num_trues == 0:
+        idf1_score = 0.0
+    else:
+        matches_counts, _ = greedy_match(global_match_matrix, num_preds, num_trues)
+        IDTP = np.sum(matches_counts)
+        total_true_boxes = len(parts_t)
+        total_pred_boxes = len(parts_p)
+        
+        IDFP = total_pred_boxes - IDTP
+        IDFN = total_true_boxes - IDTP
+        
+        if (2 * IDTP + IDFP + IDFN) == 0:
+            idf1_score = 0.0
+        else:
+            idf1_score = (2 * IDTP) / (2 * IDTP + IDFP + IDFN)
+            
+    return {
+        "IDF1 Score": idf1_score,
+        "ID Switches": id_switches,
+        "Fragmentacoes": fragmentations,
+        "Erro de Contagem de IDs": id_count_error
+    }
