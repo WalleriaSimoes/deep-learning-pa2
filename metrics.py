@@ -53,7 +53,39 @@ def compute_metrics(iou_matrix, limiares):
 
     return true_positives, false_positves, false_negatives, float(mean_average_precision), float(abs_count_error)
 
-import numpy as np
+
+def calculate_iou_matrix(detections_t_minus_1, detections_t):
+    """
+    Calcula a matriz de IoU entre as deteccoes de dois quadros diferentes.
+    Assume o formato MOT padrao para as colunas: [frame, id, x, y, w, h, ...]
+    """
+    # Extrai coordenadas (x1, y1) e calcula (x2, y2) para T-1
+    p_x1, p_y1 = detections_t_minus_1[:, 2], detections_t_minus_1[:, 3]
+    p_x2, p_y2 = p_x1 + detections_t_minus_1[:, 4], p_y1 + detections_t_minus_1[:, 5]
+
+    # Extrai coordenadas (x1, y1) e calcula (x2, y2) para T
+    t_x1, t_y1 = detections_t[:, 2], detections_t[:, 3]
+    t_x2, t_y2 = t_x1 + detections_t[:, 4], t_y1 + detections_t[:, 5]
+
+    # Broadcasting Geometrico
+    xA = np.maximum(p_x1[:, None], t_x1[None, :])
+    yA = np.maximum(p_y1[:, None], t_y1[None, :])
+    xB = np.minimum(p_x2[:, None], t_x2[None, :])
+    yB = np.minimum(p_y2[:, None], t_y2[None, :])
+
+    inter_w = np.clip(xB - xA, 0, None)
+    inter_h = np.clip(yB - yA, 0, None)
+    inter_area = inter_w * inter_h
+
+    area_p = detections_t_minus_1[:, 4] * detections_t_minus_1[:, 5]
+    area_t = detections_t[:, 4] * detections_t[:, 5]
+    union_area = area_p[:, None] + area_t[None, :] - inter_area
+
+    # Previne divisao por zero
+    iou_matrix = np.divide(inter_area, union_area, out=np.zeros_like(inter_area), where=union_area!=0)
+    
+    return iou_matrix
+
 
 def compute_intersection(ground_truth, preds, threshold=0.5):
     # Converte o texto em matrizes NumPy 2D
@@ -63,16 +95,13 @@ def compute_intersection(ground_truth, preds, threshold=0.5):
     unique_true_ids = np.unique(parts_t[:, 1])
     unique_preds_ids = np.unique(parts_p[:, 1])
 
-    # Matriz global do IDF1 e dicionários de mapeamento
     global_match_matrix = np.zeros((unique_preds_ids.shape[0], unique_true_ids.shape[0]))
     map_t = {id_val: idx for idx, id_val in enumerate(unique_true_ids)}
     map_p = {id_val: idx for idx, id_val in enumerate(unique_preds_ids)}
 
-    # Variáveis de memória para os ID Switches
     previous_match = {}  
     id_switches = 0      
 
-    # Loop Temporal
     num_frames = int(parts_t[-1, 0])
     for f in range(num_frames):
         frame_t = parts_t[parts_t[:, 0] == (f + 1)]
@@ -82,30 +111,13 @@ def compute_intersection(ground_truth, preds, threshold=0.5):
             continue
 
         ids_t = frame_t[:, 1]
-        t_x1, t_y1 = frame_t[:, 2], frame_t[:, 3]
-        t_x2, t_y2 = t_x1 + frame_t[:, 4], t_y1 + frame_t[:, 5]
-
         ids_p = frame_p[:, 1]
-        p_x1, p_y1 = frame_p[:, 2], frame_p[:, 3]
-        p_x2, p_y2 = p_x1 + frame_p[:, 4], p_y1 + frame_p[:, 5]
 
-        # Broadcasting Geométrico
-        xA = np.maximum(p_x1[:, None], t_x1[None, :])
-        yA = np.maximum(p_y1[:, None], t_y1[None, :])
-        xB = np.minimum(p_x2[:, None], t_x2[None, :])
-        yB = np.minimum(p_y2[:, None], t_y2[None, :])
+        # A funcao substitui dezenas de linhas por uma so.
+        # Passamos frame_p no lugar de T-1, e frame_t no lugar de T
+        iou_matrix = calculate_iou_matrix(frame_p, frame_t)
 
-        inter_w = np.clip(xB - xA, 0, None)
-        inter_h = np.clip(yB - yA, 0, None)
-        inter_area = inter_w * inter_h
-
-        area_p = frame_p[:, 4] * frame_p[:, 5]
-        area_t = frame_t[:, 4] * frame_t[:, 5]
-        union_area = area_p[:, None] + area_t[None, :] - inter_area
-
-        iou_matrix = inter_area / union_area
-
-        # Resolve oclusões neste frame específico
+        # Resolve oclusoes neste frame especifico
         matches_iou, matches = greedy_match(iou_matrix, len(ids_p), len(ids_t))
         
         current_match = {}
@@ -113,7 +125,6 @@ def compute_intersection(ground_truth, preds, threshold=0.5):
         for p_idx in range(len(ids_p)):
             t_idx = matches[p_idx]
             
-            # Rejeita se não casou ou se o IoU for menor que o limiar (0.5)
             if t_idx is None or matches_iou[p_idx] < threshold:
                 continue
                 
@@ -121,14 +132,12 @@ def compute_intersection(ground_truth, preds, threshold=0.5):
             real_id_p = ids_p[p_idx]
             real_id_t = ids_t[t_idx]
             
-            # Atualiza a Matriz Global para a função de baixo usar depois
             mat_row = map_p[real_id_p]
             mat_col = map_t[real_id_t]
             global_match_matrix[mat_row, mat_col] += 1
             
             current_match[real_id_t] = real_id_p
             
-            # Contabilidade dos Switches
             if real_id_t in previous_match:
                 if previous_match[real_id_t] != real_id_p:
                     id_switches += 1
@@ -161,3 +170,103 @@ def compute_idf1(ground_truth, preds, threshold=0.5):
     
     # Retorna o score final e a contagem de erros
     return idf1_score, id_switches
+
+
+
+
+def naive_tracker_shift(ground_truth_data, threshold: float=0.5, max_age: int=3):
+    """
+    Rastreador ingenuo com memoria de K quadros.
+    Parametro max_age (K) define quantos quadros uma track sobrevive sem pareamento.
+    """
+    detections = np.array([list(map(float, x.split(','))) for x in ground_truth_data])
+    num_frames = int(detections[-1, 0])
+    
+    tracked_results = []
+    next_new_id = 1 
+    
+    # Dicionario para rastrear os IDs de tracks ativas: {ID_da_Track: {'bbox': array_da_caixa, 'age': quadros_sem_ver}}
+    active_tracks = {}
+    
+    for f in range(1, num_frames + 1):
+        frame_t = detections[detections[:, 0] == f]
+        
+        if len(frame_t) == 0:
+            # Se o quadro estiver vazio, todas as tracks envelhecem
+            tracks_to_delete = []
+            for tid in active_tracks:
+                active_tracks[tid]['age'] += 1
+                if active_tracks[tid]['age'] >= max_age:
+                    tracks_to_delete.append(tid)
+            for tid in tracks_to_delete:
+                del active_tracks[tid]
+            continue
+
+        if len(active_tracks) == 0:
+            # Se nao ha memória, todas as deteccoes nascem como tracks novas
+            for i in range(len(frame_t)):
+                res = frame_t[i].copy()
+                res[1] = next_new_id
+                active_tracks[next_new_id] = {'bbox': res, 'age': 0}
+                tracked_results.append(res)
+                next_new_id += 1
+            continue
+
+        # Montar um array NumPy com as caixas das tracks ativas para a matematica vetorial
+        active_ids = list(active_tracks.keys())
+        active_bboxes = np.array([active_tracks[tid]['bbox'] for tid in active_ids])
+        
+        # Calcula IoU entre as tracks ativas e as novas deteccoes
+        iou_matrix = calculate_iou_matrix(active_bboxes, frame_t)
+        
+        # Pareamento guloso
+        matches_iou, matches = greedy_match(iou_matrix, len(active_bboxes), len(frame_t))
+        
+        # Mapear as correspondencias aprovadas
+        matched_current_to_memory = {}
+        matched_memory_indices = set()
+        
+        for p_idx in range(len(active_bboxes)):
+            t_idx = matches[p_idx]
+            if t_idx is not None and matches_iou[p_idx] >= threshold:
+                matched_current_to_memory[int(t_idx)] = p_idx
+                matched_memory_indices.add(p_idx)
+                
+        # Processar deteccoes do quadro atual
+        for t_idx in range(len(frame_t)):
+            res = frame_t[t_idx].copy()
+            
+            if t_idx in matched_current_to_memory:
+                # Se casou, recupera o ID, atualiza a posicao zera a idade
+                p_idx = matched_current_to_memory[t_idx]
+                track_id = active_ids[p_idx]
+                
+                res[1] = track_id
+                active_tracks[track_id]['bbox'] = res
+                active_tracks[track_id]['age'] = 0
+            else:
+                # Se nao casou, nasce uma track nova com idade 0
+                track_id = next_new_id
+                next_new_id += 1
+                
+                res[1] = track_id
+                active_tracks[track_id] = {'bbox': res, 'age': 0}
+                
+            tracked_results.append(res)
+            
+        # Gerir o ciclo de vida das tracks na memoria
+        tracks_to_delete = []
+        for p_idx, track_id in enumerate(active_ids):
+            if p_idx not in matched_memory_indices:
+                # Se a track nao encontrou par neste quadro, ela envelhece
+                active_tracks[track_id]['age'] += 1
+                
+                # Se ultrapassou o limite K, a track e marcada para morrer
+                if active_tracks[track_id]['age'] >= max_age:
+                    tracks_to_delete.append(track_id)
+                    
+        # Remove definitivamente as tracks mortas da memoria ativa
+        for tid in tracks_to_delete:
+            del active_tracks[tid]
+
+    return np.array(tracked_results)
