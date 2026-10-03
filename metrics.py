@@ -1,5 +1,20 @@
 import numpy as np
-import torch
+from scipy.optimize import linear_sum_assignment
+
+
+def idtp_otimo(matriz_contagem):
+    """Atribuição global 1-para-1 ÓTIMA (Hungarian) entre IDs previstos (linhas) e verdadeiros (colunas).
+    Devolve IDTP = máximo de caixas corretamente identificadas. (O guloso subestima o IDF1.)"""
+    if matriz_contagem.size == 0:
+        return 0.0
+    r, c = linear_sum_assignment(-matriz_contagem)
+    return float(matriz_contagem[r, c].sum())
+
+
+def tracks_to_str(arr):
+    """Converte array (N,9) [f,id,x,y,w,h,conf,cls,vis] em lista de strings, sem truncar as coordenadas."""
+    return [f"{int(r[0])}, {int(r[1])}, {r[2]:.1f}, {r[3]:.1f}, {r[4]:.1f}, {r[5]:.1f}, {r[6]:.2f}, {int(r[7])}, {r[8]:.2f}"
+            for r in arr]
 
 def greedy_match(iou, predicts, trues):
     iou = iou.copy()
@@ -150,27 +165,9 @@ def compute_intersection(ground_truth, preds, threshold=0.5):
 
 
 def compute_idf1(ground_truth, preds, threshold=0.5):
-    # Pega os dados brutos da trajetória gerados pela função de cima
-    global_match_matrix, num_preds, num_trues, id_switches = compute_intersection(ground_truth, preds, threshold)
-    
-    # PAREAMENTO 2 (Global): Força a regra 1-para-1 do vídeo inteiro
-    matches_counts, _ = greedy_match(global_match_matrix, num_preds, num_trues)
-    
-    # Matemática da Métrica
-    IDTP = np.sum(matches_counts)
-    total_true = len(ground_truth)
-    total_pred = len(preds)
-    
-    IDFP = total_pred - IDTP
-    IDFN = total_true - IDTP
-    
-    if (2 * IDTP + IDFP + IDFN) == 0:
-        return 0.0, id_switches
-        
-    idf1_score = (2 * IDTP) / (2 * IDTP + IDFP + IDFN)
-    
-    # Retorna o score final e a contagem de erros
-    return idf1_score, id_switches
+    """Atalho: devolve (IDF1, ID switches). Usa a mesma implementação de evaluate_trajectories."""
+    m = evaluate_trajectories(ground_truth, preds, threshold)
+    return m["IDF1 Score"], m["ID Switches"]
 
 
 
@@ -279,6 +276,10 @@ def evaluate_trajectories(ground_truth, preds, threshold=0.5):
     e Erro de Contagem de identidades unicas.
     """
     parts_t = np.array([list(map(float, x.split(','))) for x in ground_truth])
+    if len(preds) == 0:
+        ids = np.unique(parts_t[:, 1])
+        return {"IDF1 Score": 0.0, "ID Switches": 0, "Fragmentacoes": 0,
+                "Erro de Contagem de IDs": len(ids), "Track History": {t: [0] * int((parts_t[:, 1] == t).sum()) for t in ids}}
     parts_p = np.array([list(map(float, x.split(','))) for x in preds])
 
     unique_true_ids = np.unique(parts_t[:, 1])
@@ -379,8 +380,7 @@ def evaluate_trajectories(ground_truth, preds, threshold=0.5):
     if num_preds == 0 or num_trues == 0:
         idf1_score = 0.0
     else:
-        matches_counts, _ = greedy_match(global_match_matrix, num_preds, num_trues)
-        IDTP = np.sum(matches_counts)
+        IDTP = idtp_otimo(global_match_matrix)
         total_true_boxes = len(parts_t)
         total_pred_boxes = len(parts_p)
         
@@ -400,130 +400,37 @@ def evaluate_trajectories(ground_truth, preds, threshold=0.5):
         "Track History": track_history 
     }
 
-def gru_tracker_shift(ground_truth_data, model, device, img_w, img_h, threshold=0.3, max_age=3, min_hits=2, T=8):
-    """
-    Rastreador Inteligente Final (Trilha A).
-    Usa a GRU estritamente para translação (x,y) e congela a escala (w,h).
-    """
-    detections = np.array([list(map(float, x.split(','))) for x in ground_truth_data])
-    if len(detections) == 0: return []
-    num_frames = int(detections[-1, 0])
-    
-    tracked_results = []
-    next_new_id = 1 
-    active_tracks = {}
-    model.eval()
-    
-    for f in range(1, num_frames + 1):
-        frame_t = detections[detections[:, 0] == f]
-        active_ids = list(active_tracks.keys())
-        predicted_matrix = []
-        
-        # --- PASSO 1: PREVISÃO GRU (X e Y apenas) ---
-        for tid in active_ids:
-            track = active_tracks[tid]
-            tamanho_necessario = T - 1
-            
-            # Última posição real observada
-            x_last, y_last, w_last, h_last = track['bbox'][2:6]
-            
-            if len(track['history']) < tamanho_necessario:
-                # Inércia Zero
-                x, y, w, h = x_last, y_last, w_last, h_last
-            else:
-                historico = track['history'][-tamanho_necessario:]
-                seq_input = torch.tensor(historico, dtype=torch.float32).unsqueeze(0).to(device)
-                
-                # Removi a inicialização manual do hidden. 
-                # Ao passar 'None', o PyTorch cria automaticamente zeros no formato certo (seja GRU, LSTM ou RNN simples).
-                with torch.no_grad():
-                    pred_norm, _ = model(seq_input, None)
-                
-                pred_box = pred_norm.view(-1).cpu().numpy()
-                
-                # REMOVEMOS O TRAVÃO: A GRU assume 100% do controlo da translação
-                x = pred_box[0] * img_w
-                y = pred_box[1] * img_h
-                
-                # CONGELAMENTO DE ESCALA: Mantido para impedir caixas palito
-                w = w_last
-                h = h_last
-            
-            dummy_box = np.zeros(9)
-            dummy_box[0] = f
-            dummy_box[1] = tid
-            dummy_box[2:6] = [x, y, w, h]
-            dummy_box[6:9] = 1.0
-            predicted_matrix.append(dummy_box)
-             
-        predicted_matrix = np.array(predicted_matrix) if len(predicted_matrix) > 0 else np.zeros((0, 9))
-        
-        # --- PASSO 2: MATCHING ---
-        if len(predicted_matrix) > 0 and len(frame_t) > 0:
-            iou_matrix = calculate_iou_matrix(predicted_matrix, frame_t)
-            matches_iou, matches = greedy_match(iou_matrix, len(predicted_matrix), len(frame_t))
-        else:
-            matches_iou = [0] * len(predicted_matrix)
-            matches = [None] * len(predicted_matrix)
-            
-        matched_current_to_memory = {}
-        matched_memory_indices = set()
-        
-        for p_idx in range(len(predicted_matrix)):
-            t_idx = matches[p_idx]
-            if t_idx is not None and matches_iou[p_idx] >= threshold:
-                matched_current_to_memory[int(t_idx)] = p_idx
-                matched_memory_indices.add(p_idx)
-                
-        # --- PASSO 3: ATUALIZAÇÃO COM OBSERVAÇÃO REAL ---
-        for t_idx in range(len(frame_t)):
-            res = frame_t[t_idx].copy()
-            norm_obs = [res[2]/img_w, res[3]/img_h, res[4]/img_w, res[5]/img_h]
-            
-            if t_idx in matched_current_to_memory:
-                p_idx = matched_current_to_memory[t_idx]
-                track_id = active_ids[p_idx]
-                
-                res[1] = track_id
-                active_tracks[track_id]['bbox'] = res
-                active_tracks[track_id]['history'].append(norm_obs)
-                active_tracks[track_id]['age'] = 0
-                active_tracks[track_id]['hits'] += 1
-            else:
-                track_id = next_new_id
-                next_new_id += 1
-                
-                res[1] = track_id
-                active_tracks[track_id] = {
-                    'bbox': res,
-                    'age': 0,
-                    'history': [norm_obs],
-                    'hits': 1 
-                }
-                
-            # Mostra se a track foi confirmada
-            if active_tracks[res[1]]['hits'] >= min_hits:
-                tracked_results.append(res)
-            
-        # --- PASSO 4: OCLUSÃO E MORTE ---
-        tracks_to_delete = []
-        for p_idx, track_id in enumerate(active_ids):
-            if p_idx not in matched_memory_indices:
-                active_tracks[track_id]['age'] += 1
-                
-                if active_tracks[track_id]['age'] < max_age:
-                    fake_res = predicted_matrix[p_idx].copy()
-                    active_tracks[track_id]['bbox'] = fake_res
-                    
-                    norm_fake = [fake_res[2]/img_w, fake_res[3]/img_h, fake_res[4]/img_w, fake_res[5]/img_h]
-                    active_tracks[track_id]['history'].append(norm_fake)
-                    
-                    if active_tracks[track_id]['hits'] >= min_hits:
-                        tracked_results.append(fake_res)
-                else:
-                    tracks_to_delete.append(track_id)
-                    
-        for tid in tracks_to_delete:
-            del active_tracks[tid]
 
-    return np.array(tracked_results)
+def run_metric_tests(verbose=True):
+    """
+    Parte 0, item 3: três casos construídos à mão (3 objetos, 20 quadros, caixas disjuntas).
+      (a) predição = GT                       -> IDF1 = 1, 0 switches
+      (b) IDs 1 e 2 trocados a partir de k=11 -> 2 switches; IDTP = 60-20 = 40  -> IDF1 = 2/3
+      (c) track 1 partida em duas em k=11     -> 1 switch;   IDTP = 60-10 = 50  -> IDF1 = 5/6
+    (b) e (c) usam o mesmo k, mas (b) estraga duas identidades e (c) só uma, então o IDF1 é diferente.
+    """
+    F, k = 20, 11
+    gt = [f"{f}, {i}, {20 + 35 * i + 2 * f}, {30 * i}, 15, 15, 1, 1, 1.0" for f in range(1, F + 1) for i in (1, 2, 3)]
+
+    def remap(fn):
+        out = []
+        for l in gt:
+            p = l.split(',')
+            p[1] = str(fn(int(p[0]), int(p[1])))
+            out.append(','.join(p))
+        return out
+
+    a = evaluate_trajectories(gt, remap(lambda f, i: i))
+    b = evaluate_trajectories(gt, remap(lambda f, i: ({1: 2, 2: 1}.get(i, i)) if f >= k else i))
+    c = evaluate_trajectories(gt, remap(lambda f, i: 99 if (i == 1 and f >= k) else i))
+
+    assert np.isclose(a["IDF1 Score"], 1.0) and a["ID Switches"] == 0, a
+    assert b["ID Switches"] == 2 and np.isclose(b["IDF1 Score"], 2 / 3), b
+    assert c["ID Switches"] == 1 and np.isclose(c["IDF1 Score"], 5 / 6), c
+    assert not np.isclose(b["IDF1 Score"], c["IDF1 Score"])
+    if verbose:
+        print("(a) pred = GT          : IDF1 = %.4f | switches = %d" % (a["IDF1 Score"], a["ID Switches"]))
+        print("(b) 2 IDs trocados k=11: IDF1 = %.4f (esperado 0.6667) | switches = %d (esperado 2)" % (b["IDF1 Score"], b["ID Switches"]))
+        print("(c) track partida  k=11: IDF1 = %.4f (esperado 0.8333) | switches = %d (esperado 1)" % (c["IDF1 Score"], c["ID Switches"]))
+        print("Todos os asserts passaram.")
+    return a, b, c
